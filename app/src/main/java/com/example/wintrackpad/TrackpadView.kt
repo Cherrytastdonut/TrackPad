@@ -229,10 +229,10 @@ class TrackpadView(
         haptic(Haptic.DRAG_START)
     }
 
-    private fun cancelLongPress() = removeCallbacks(longPressRunnable)
+    private fun cancelHoldTimer() = removeCallbacks(longPressRunnable)
 
     private fun onPointerDown(e: MotionEvent) {
-        cancelLongPress()
+        cancelHoldTimer()
         recordDown(e, e.actionIndex)
         maxPointers = max(maxPointers, e.pointerCount)
         val n = e.pointerCount
@@ -278,7 +278,7 @@ class TrackpadView(
             }
 
             Mode.POINTER -> {
-                if (maxDisp > tapSlop) cancelLongPress()
+                if (maxDisp > tapSlop) cancelHoldTimer()
                 if (tapDragArmed && maxDisp > tapSlop) {
                     tapDragArmed = false
                     committed = true
@@ -404,7 +404,7 @@ class TrackpadView(
     }
 
     private fun onLastUp(e: MotionEvent) {
-        cancelLongPress()
+        cancelHoldTimer()
         val dur = e.eventTime - downTime
 
         when (mode) {
@@ -449,7 +449,7 @@ class TrackpadView(
     }
 
     private fun cancelGesture() {
-        cancelLongPress()
+        cancelHoldTimer()
         when (mode) {
             Mode.DRAG -> hid.setButtons(0)
             Mode.PINCH, Mode.SWIPE_SWITCH -> hid.keyboard(0)
