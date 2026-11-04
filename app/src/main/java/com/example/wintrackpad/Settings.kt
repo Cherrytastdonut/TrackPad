@@ -50,7 +50,7 @@ class Settings(context: Context) {
 
     /** 화면 아래 큰 클릭 버튼 줄 (탭 클릭을 끄면 자동으로 표시) */
     var showClickButtons: Boolean
-        get() = bool("showClickButtons", false)
+        get() = bool("showClickButtons", true)
         set(v) = putBool("showClickButtons", v)
 
     /** 실제로 버튼 줄을 보여줄지: 탭 클릭이 꺼져 있으면 클릭 수단이 없어지므로 강제로 표시 */
@@ -64,6 +64,11 @@ class Settings(context: Context) {
     var windows11: Boolean
         get() = bool("windows11", true)
         set(v) = putBool("windows11", v)
+
+    /** 알림 권한을 이미 한 번 물어봤는지 */
+    var notificationAsked: Boolean
+        get() = bool("notificationAsked", false)
+        set(v) = putBool("notificationAsked", v)
 
     /** 마지막으로 연결한 PC의 블루투스 주소 (자동 재연결용) */
     var lastHost: String?

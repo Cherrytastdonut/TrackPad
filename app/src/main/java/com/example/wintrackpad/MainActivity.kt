@@ -4,22 +4,22 @@ import android.Manifest
 import android.annotation.SuppressLint
 import android.app.Activity
 import android.bluetooth.BluetoothAdapter
-import android.bluetooth.BluetoothClass
 import android.bluetooth.BluetoothDevice
 import android.bluetooth.BluetoothManager
-import android.content.BroadcastReceiver
+import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
-import android.content.IntentFilter
+import android.content.ServiceConnection
+import android.content.pm.ActivityInfo
 import android.content.pm.PackageManager
 import android.graphics.Color
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.os.Build
 import android.os.Bundle
-import android.os.Handler
-import android.os.Looper
+import android.os.IBinder
 import android.view.Gravity
+import android.view.MotionEvent
 import android.view.View
 import android.view.ViewGroup
 import android.view.WindowInsets
@@ -33,7 +33,7 @@ import android.widget.SeekBar
 import android.widget.Switch
 import android.widget.TextView
 
-@SuppressLint("MissingPermission", "SetTextI18n", "UseSwitchCompatOrMaterialCode")
+@SuppressLint("MissingPermission", "SetTextI18n", "UseSwitchCompatOrMaterialCode", "ClickableViewAccessibility")
 class MainActivity : Activity(), HidManager.Listener {
 
     private companion object {
@@ -43,14 +43,17 @@ class MainActivity : Activity(), HidManager.Listener {
     }
 
     private lateinit var settings: Settings
-    private var hid: HidManager? = null
-    private val main = Handler(Looper.getMainLooper())
+
+    /** 연결은 백그라운드 서비스가 가지고 있다 */
+    private var service: HidService? = null
+    private val hid: HidManager? get() = service?.hid
+    private var bound = false
 
     private lateinit var setupRoot: View
     private lateinit var statusText: TextView
     private lateinit var connectedBox: LinearLayout
     private lateinit var connectedLabel: TextView
-    private lateinit var deviceList: LinearLayout
+    private lateinit var reconnectButton: Button
 
     private var trackpad: TrackpadView? = null
     private var pauseButton: TextView? = null
@@ -58,9 +61,6 @@ class MainActivity : Activity(), HidManager.Listener {
     private var dragLockButton: Button? = null
 
     private var trackpadShown = false
-    private var resumed = false
-    private var autoConnectTried = false
-    private var receiverRegistered = false
 
     private val dp get() = resources.displayMetrics.density
     private fun px(v: Int) = (v * dp).toInt()
@@ -79,38 +79,31 @@ class MainActivity : Activity(), HidManager.Listener {
         }
         setupRoot = buildSetupUi()
         setContentView(setupRoot)
-        val filter = IntentFilter(BluetoothAdapter.ACTION_STATE_CHANGED)
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            registerReceiver(btStateReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
-        } else {
-            registerReceiver(btStateReceiver, filter)
-        }
-        receiverRegistered = true
         ensurePermissionsThenStart()
     }
 
     override fun onResume() {
         super.onResume()
-        resumed = true
-        recoverIfNeeded()
+        service?.recoverIfNeeded()
+        updateSetupState()
     }
 
     override fun onPause() {
-        // 다른 앱으로 가거나 화면이 꺼지면 눌린 버튼·키와 관성을 정리 (연결은 유지)
+        // 화면을 떠날 때 진행 중인 제스처·관성·눌린 버튼을 정리 (연결은 서비스가 유지)
         trackpad?.cancelAll()
-        hid?.releaseAll()
-        resumed = false
         super.onPause()
     }
 
     override fun onDestroy() {
-        if (receiverRegistered) {
-            unregisterReceiver(btStateReceiver)
-            receiverRegistered = false
-        }
         trackpad?.cancelAll()
-        hid?.stop()
-        hid = null
+        service?.let {
+            if (it.client === this) it.client = null
+            it.onQuit = null
+        }
+        if (bound) {
+            unbindService(connection)
+            bound = false
+        }
         super.onDestroy()
     }
 
@@ -126,50 +119,27 @@ class MainActivity : Activity(), HidManager.Listener {
             showSetup()
             return
         }
-        @Suppress("DEPRECATION")
-        super.onBackPressed()
+        // 앱을 닫아도 연결은 백그라운드에서 유지된다 (알림에서 종료 가능)
+        moveTaskToBack(true)
     }
 
-    /** 앱 복귀 시: 권한·블루투스·HID 등록 상태를 다시 확인하고 복구 */
-    private fun recoverIfNeeded() {
-        if (missingPermissions().isNotEmpty()) return
-        val adapter = getSystemService(BluetoothManager::class.java)?.adapter ?: return
-        if (!adapter.isEnabled) return
-        val h = hid
-        when {
-            h == null -> startHid()
-            h.isProxyLost -> {
-                h.stop()
-                hid = null
-                autoConnectTried = false
-                startHid()
-            }
-            !h.isRegistered -> {
-                status("HID를 다시 등록하는 중…")
-                if (!h.ensureRegistered()) status("HID 다시 등록 실패. 앱을 다시 열어 주세요.")
-            }
+    private val connection = object : ServiceConnection {
+        override fun onServiceConnected(name: ComponentName?, binder: IBinder?) {
+            val s = (binder as HidService.LocalBinder).service
+            service = s
+            s.onQuit = { finishAndRemoveTask() }
+            s.client = this@MainActivity // 현재 상태를 바로 다시 알려 준다
+            updateSetupState()
         }
-    }
 
-    private val btStateReceiver = object : BroadcastReceiver() {
-        override fun onReceive(context: Context, intent: Intent) {
-            when (intent.getIntExtra(BluetoothAdapter.EXTRA_STATE, BluetoothAdapter.ERROR)) {
-                BluetoothAdapter.STATE_TURNING_OFF, BluetoothAdapter.STATE_OFF -> {
-                    trackpad?.cancelAll()
-                    hid?.stop()
-                    hid = null
-                    autoConnectTried = false
-                    if (trackpadShown) showSetup()
-                    updateConnectedBox()
-                    status("블루투스가 꺼졌습니다. 블루투스를 켜면 자동으로 다시 준비합니다.")
-                }
-                BluetoothAdapter.STATE_ON -> if (resumed) recoverIfNeeded()
-            }
+        override fun onServiceDisconnected(name: ComponentName?) {
+            service = null
+            updateSetupState()
         }
     }
 
     // ------------------------------------------------------------------
-    // 권한 / 블루투스 켜기
+    // 권한 / 블루투스 켜기 / 서비스 시작
     // ------------------------------------------------------------------
 
     private fun requiredPermissions(): Array<String> =
@@ -182,10 +152,18 @@ class MainActivity : Activity(), HidManager.Listener {
     }
 
     private fun ensurePermissionsThenStart() {
-        val missing = missingPermissions()
-        if (missing.isNotEmpty()) {
+        val ask = missingPermissions().toMutableList()
+        // 알림 권한은 선택: 거부해도 동작하지만 알림창에 표시되지 않을 수 있음
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED &&
+            !settings.notificationAsked
+        ) {
+            ask += Manifest.permission.POST_NOTIFICATIONS
+            settings.notificationAsked = true
+        }
+        if (ask.isNotEmpty()) {
             status("블루투스 권한을 허용해 주세요.")
-            requestPermissions(missing.toTypedArray(), REQ_PERMS)
+            requestPermissions(ask.toTypedArray(), REQ_PERMS)
         } else {
             ensureBluetoothOn()
         }
@@ -210,7 +188,14 @@ class MainActivity : Activity(), HidManager.Listener {
             startActivityForResult(Intent(BluetoothAdapter.ACTION_REQUEST_ENABLE), REQ_ENABLE_BT)
             return
         }
-        startHid()
+        startAndBindService()
+    }
+
+    private fun startAndBindService() {
+        HidService.start(this)
+        if (!bound) {
+            bound = bindService(Intent(this, HidService::class.java), connection, Context.BIND_AUTO_CREATE)
+        }
     }
 
     @Deprecated("Deprecated in Java")
@@ -219,7 +204,7 @@ class MainActivity : Activity(), HidManager.Listener {
         super.onActivityResult(requestCode, resultCode, data)
         when (requestCode) {
             REQ_ENABLE_BT ->
-                if (resultCode == RESULT_OK) startHid() else status("블루투스가 꺼져 있습니다.")
+                if (resultCode == RESULT_OK) startAndBindService() else status("블루투스가 꺼져 있습니다.")
             REQ_DISCOVERABLE ->
                 if (resultCode != RESULT_CANCELED) {
                     val name = hid?.adapter?.name ?: "이 폰"
@@ -231,72 +216,38 @@ class MainActivity : Activity(), HidManager.Listener {
         }
     }
 
-    private fun startHid() {
-        if (hid != null) return
-        val h = HidManager(this, this)
-        hid = h
-        if (!h.start()) {
-            status("이 기기는 블루투스 HID(키보드/마우스) 기능을 지원하지 않습니다.")
-            h.stop()
-            hid = null
-            return
-        }
-        status("블루투스 HID 준비 중…")
-        main.postDelayed({
-            if (hid === h && !h.isRegistered && !trackpadShown) {
-                status(
-                    "HID 등록이 되지 않습니다.\n" +
-                        "• 다른 블루투스 키보드/마우스 앱이 실행 중이면 종료하세요.\n" +
-                        "• 일부 제조사 폰은 이 기능을 막아 두었습니다."
-                )
-            }
-        }, 5000)
+    // ------------------------------------------------------------------
+    // HidManager.Listener (서비스가 전달)
+    // ------------------------------------------------------------------
+
+    override fun onHidStatus(message: String) {
+        status(message)
+        updateSetupState()
     }
 
-    // ------------------------------------------------------------------
-    // HidManager.Listener
-    // ------------------------------------------------------------------
-
-    override fun onHidStatus(message: String) = status(message)
-
     override fun onHidReady() {
-        status("준비 완료. 아래에서 PC를 선택하거나, 처음이면 '페어링'을 먼저 하세요.")
-        refreshDevices()
-        // 마지막으로 쓰던 PC에 자동 재연결
-        val h = hid ?: return
-        if (autoConnectTried || h.host != null) return
-        autoConnectTried = true
-        val addr = settings.lastHost ?: return
-        val dev = bondedDevices().firstOrNull { it.address == addr } ?: return
-        if (h.connect(dev)) status("${h.deviceName(dev)}에 다시 연결하는 중…")
+        status("준비 완료. 처음이면 '페어링'을, 이미 페어링했다면 PC에서 연결하거나 아래 '다시 연결'을 누르세요.")
+        updateSetupState()
     }
 
     override fun onHidUnregistered() {
         trackpad?.cancelAll()
         if (trackpadShown) showSetup()
-        updateConnectedBox()
-        // 앱이 앞에 있으면 바로 다시 등록, 아니면 복귀(onResume) 때 등록
-        if (resumed) {
-            status("HID 등록이 해제되어 다시 등록하는 중…")
-            main.postDelayed({ if (resumed) recoverIfNeeded() }, 500)
-        } else {
-            status("앱이 백그라운드에 있어 HID 등록이 해제되었습니다. 돌아오면 다시 등록합니다.")
-        }
+        status("HID 등록이 해제되어 다시 등록하는 중…")
+        updateSetupState()
     }
 
     override fun onHostConnected(device: BluetoothDevice) {
-        settings.lastHost = device.address
-        updateConnectedBox()
-        showTrackpad()
+        updateSetupState()
+        if (!trackpadShown) showTrackpad()
         trackpad?.let { Haptics.perform(it, Haptic.CONFIRM, settings.hapticFeedback) }
     }
 
     override fun onHostDisconnected() {
         trackpad?.cancelAll()
         if (trackpadShown) showSetup()
-        updateConnectedBox()
-        status("연결이 끊어졌습니다. 아래에서 PC를 다시 선택하세요.")
-        refreshDevices()
+        status("연결이 끊어졌습니다.")
+        updateSetupState()
     }
 
     override fun onSendHealthChanged(healthy: Boolean) {
@@ -308,19 +259,21 @@ class MainActivity : Activity(), HidManager.Listener {
     }
 
     // ------------------------------------------------------------------
-    // 트랙패드 화면
+    // 트랙패드 화면 (가로 고정)
     // ------------------------------------------------------------------
 
     private fun showTrackpad() {
         val h = hid ?: return
-        if (h.host == null) return
+        if (!h.isConnected) return
         trackpad?.cancelAll()
+
+        // 가로로 조작 (폰을 어느 쪽으로 돌려도 가로 유지)
+        requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
 
         val frame = FrameLayout(this).apply { setBackgroundColor(Color.WHITE) }
         val pad = TrackpadView(this, h, settings)
         trackpad = pad
 
-        // 트랙패드 + (선택) 아래 클릭 버튼 줄
         val column = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         column.addView(pad, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
         if (settings.clickButtonsVisible) column.addView(buildClickBar(h, pad))
@@ -336,7 +289,7 @@ class MainActivity : Activity(), HidManager.Listener {
         frame.addView(
             topBar,
             FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.TOP or Gravity.END)
-                .apply { topMargin = px(28); rightMargin = px(8) }
+                .apply { topMargin = px(12); rightMargin = px(24) }
         )
 
         // 연결 직후 잠깐 보이는 안내 (터치는 아래 트랙패드로 그대로 전달됨)
@@ -352,7 +305,6 @@ class MainActivity : Activity(), HidManager.Listener {
         )
         label.animate().alpha(0f).setStartDelay(2000).setDuration(700).start()
 
-        // 전송 실패 배너
         healthBanner = TextView(this).apply {
             text = "PC로 입력이 전달되지 않고 있습니다"
             setTextColor(Color.WHITE)
@@ -365,7 +317,7 @@ class MainActivity : Activity(), HidManager.Listener {
         frame.addView(
             healthBanner,
             FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.TOP or Gravity.CENTER_HORIZONTAL)
-                .apply { topMargin = px(80) }
+                .apply { topMargin = px(56) }
         )
 
         setContentView(frame)
@@ -376,30 +328,28 @@ class MainActivity : Activity(), HidManager.Listener {
     private fun setPaused(p: Boolean) {
         val pad = trackpad ?: return
         pad.paused = p
+        hid?.releaseAll()
         pauseButton?.text = if (p) "다시 시작" else "일시정지"
         pad.setBackgroundColor(if (p) 0xFFEDEDED.toInt() else Color.WHITE)
         updateDragLockButton(false)
     }
 
+    /**
+     * 큰 클릭 버튼: 실제 마우스 버튼처럼 손가락이 닿으면 눌리고, 떼면 떨어진다.
+     * 짧게 누르면 클릭, 꾹 누르고 다른 손가락으로 트랙패드를 움직이면 드래그.
+     */
     private fun buildClickBar(h: HidManager, pad: TrackpadView): View {
         val bar = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
-            setPadding(px(8), px(8), px(8), px(16))
+            setPadding(px(16), px(6), px(16), px(10))
             setBackgroundColor(0xFFF2F2F2.toInt())
         }
-        fun add(b: Button) = bar.addView(b, LinearLayout.LayoutParams(0, px(72), 1f).apply { setMargins(px(4), 0, px(4), 0) })
+        fun add(v: View, weight: Float) =
+            bar.addView(v, LinearLayout.LayoutParams(0, px(64), weight).apply { setMargins(px(4), 0, px(4), 0) })
 
-        add(Button(this).apply {
-            text = "왼쪽 클릭"
-            isAllCaps = false
-            setOnClickListener {
-                if (pad.paused) return@setOnClickListener
-                h.click(HidManager.BTN_LEFT)
-                Haptics.perform(pad, Haptic.CLICK, settings.hapticFeedback)
-            }
-        })
+        add(holdButton("왼쪽 클릭", HidManager.BTN_LEFT, h, pad), 2f)
         dragLockButton = Button(this).apply {
-            text = "끌기 시작"
+            text = "끌기 고정"
             isAllCaps = false
             setOnClickListener {
                 if (pad.paused) return@setOnClickListener
@@ -409,22 +359,36 @@ class MainActivity : Activity(), HidManager.Listener {
                 Haptics.perform(pad, if (lock) Haptic.DRAG_START else Haptic.DRAG_END, settings.hapticFeedback)
                 updateDragLockButton(lock)
             }
-        }.also { add(it) }
-        add(Button(this).apply {
-            text = "오른쪽 클릭"
-            isAllCaps = false
-            setOnClickListener {
-                if (pad.paused) return@setOnClickListener
-                h.click(HidManager.BTN_RIGHT)
-                Haptics.perform(pad, Haptic.CLICK, settings.hapticFeedback)
-            }
-        })
+        }.also { add(it, 1f) }
+        add(holdButton("오른쪽 클릭", HidManager.BTN_RIGHT, h, pad), 2f)
         pad.onDragLockReleased = { updateDragLockButton(false) }
         return bar
     }
 
+    private fun holdButton(label: String, btn: Int, h: HidManager, pad: TrackpadView) = Button(this).apply {
+        text = label
+        isAllCaps = false
+        setOnTouchListener { v, e ->
+            when (e.actionMasked) {
+                MotionEvent.ACTION_DOWN -> {
+                    if (!pad.paused) {
+                        h.setHeld(btn, true)
+                        Haptics.perform(pad, Haptic.CLICK, settings.hapticFeedback)
+                    }
+                    v.isPressed = true
+                }
+                MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                    h.setHeld(btn, false)
+                    if (!pad.paused) Haptics.perform(pad, Haptic.DRAG_END, settings.hapticFeedback)
+                    v.isPressed = false
+                }
+            }
+            true
+        }
+    }
+
     private fun updateDragLockButton(locked: Boolean) {
-        dragLockButton?.text = if (locked) "놓기" else "끌기 시작"
+        dragLockButton?.text = if (locked) "놓기" else "끌기 고정"
     }
 
     private fun cornerButton(t: String, onClick: () -> Unit) = TextView(this).apply {
@@ -437,11 +401,12 @@ class MainActivity : Activity(), HidManager.Listener {
 
     private fun showSetup() {
         trackpad?.cancelAll()
+        hid?.releaseAll()
         trackpadShown = false
+        requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
         showSystemBars()
         setContentView(setupRoot)
-        updateConnectedBox()
-        refreshDevices()
+        updateSetupState()
     }
 
     private fun hideSystemBars() {
@@ -473,57 +438,27 @@ class MainActivity : Activity(), HidManager.Listener {
     }
 
     // ------------------------------------------------------------------
-    // 연결 화면 UI (코드로 구성)
+    // 설정 화면
     // ------------------------------------------------------------------
 
-    private fun bondedDevices(): List<BluetoothDevice> = try {
-        hid?.adapter?.bondedDevices?.toList() ?: emptyList()
-    } catch (e: SecurityException) {
-        emptyList()
-    }
-
-    private fun updateConnectedBox() {
+    /** 연결됨 상자 / 다시 연결 버튼 표시 상태 갱신 */
+    private fun updateSetupState() {
         if (!::connectedBox.isInitialized) return
         val h = hid
         val host = h?.host
         if (h != null && host != null) {
             connectedLabel.text = "${h.deviceName(host)}에 연결되어 있습니다."
             connectedBox.visibility = View.VISIBLE
+            reconnectButton.visibility = View.GONE
         } else {
             connectedBox.visibility = View.GONE
-        }
-    }
-
-    private fun refreshDevices() {
-        if (!::deviceList.isInitialized) return
-        deviceList.removeAllViews()
-        val h = hid
-        val devices = bondedDevices().sortedByDescending {
-            it.bluetoothClass?.majorDeviceClass == BluetoothClass.Device.Major.COMPUTER
-        }
-        if (h == null || devices.isEmpty()) {
-            deviceList.addView(bodyText("페어링된 기기가 없습니다. 위의 '페어링'을 먼저 진행하세요."))
-            return
-        }
-        for (d in devices) {
-            val isPc = d.bluetoothClass?.majorDeviceClass == BluetoothClass.Device.Major.COMPUTER
-            val b = Button(this).apply {
-                text = (if (isPc) "💻  " else "📱  ") + h.deviceName(d)
-                isAllCaps = false
-                gravity = Gravity.START or Gravity.CENTER_VERTICAL
-                setOnClickListener {
-                    if (!h.isRegistered) {
-                        status("아직 HID 준비가 안 됐습니다. 잠시 후 다시 시도하세요.")
-                    } else if (h.host?.address == d.address) {
-                        showTrackpad()
-                    } else if (h.connect(d)) {
-                        status("${h.deviceName(d)}에 연결하는 중…")
-                    } else {
-                        status("연결 요청 실패. PC의 블루투스가 켜져 있는지 확인하세요.")
-                    }
-                }
+            val last = service?.lastHostDevice()
+            if (h != null && h.isRegistered && last != null) {
+                reconnectButton.text = "${h.deviceName(last)}에 다시 연결"
+                reconnectButton.visibility = View.VISIBLE
+            } else {
+                reconnectButton.visibility = View.GONE
             }
-            deviceList.addView(b, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
         }
     }
 
@@ -559,7 +494,7 @@ class MainActivity : Activity(), HidManager.Listener {
             setTypeface(typeface, Typeface.BOLD)
             setTextColor(Color.BLACK)
         })
-        col.addView(bodyText("폰을 Windows PC의 블루투스 트랙패드로 사용합니다. PC에는 아무것도 설치할 필요가 없습니다."))
+        col.addView(bodyText("폰을 Windows PC의 블루투스 트랙패드로 사용합니다. 앱을 닫아도 알림창에 남아 연결이 유지되며, 알림을 누르면 돌아옵니다."))
 
         statusText = TextView(this).apply {
             textSize = 15f
@@ -569,7 +504,7 @@ class MainActivity : Activity(), HidManager.Listener {
         }
         col.addView(statusText, marginTop(16))
 
-        // 연결 중일 때만 보이는 상자: 트랙패드로 돌아가기 / 연결 끊기
+        // 연결 중일 때만 보이는 상자
         connectedBox = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(px(16), px(12), px(16), px(12))
@@ -591,19 +526,31 @@ class MainActivity : Activity(), HidManager.Listener {
             text = "연결 끊기"
             isAllCaps = false
             setOnClickListener {
-                hid?.disconnect()
+                service?.disconnect()
                 status("연결을 끊는 중…")
             }
         }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
         connectedBox.addView(row)
         col.addView(connectedBox, marginTop(12))
 
-        // 1. 페어링
-        col.addView(sectionTitle("1. 처음 한 번: PC와 페어링"))
+        // 연결이 끊겨 있을 때: 마지막 PC에 다시 연결
+        reconnectButton = Button(this).apply {
+            isAllCaps = false
+            visibility = View.GONE
+            setOnClickListener {
+                if (service?.reconnectLast() == true) status("다시 연결하는 중…")
+                else status("연결 요청 실패. PC의 블루투스가 켜져 있는지 확인하세요.")
+            }
+        }
+        col.addView(reconnectButton, marginTop(12))
+
+        // 처음 페어링
+        col.addView(sectionTitle("처음 한 번: PC와 페어링"))
         col.addView(bodyText(
             "① 아래 버튼을 눌러 이 폰을 검색 가능하게 합니다.\n" +
                 "② Windows에서 설정 → Bluetooth 및 장치 → 장치 추가 → Bluetooth\n" +
                 "③ 목록에서 이 폰 이름을 선택하고 페어링을 수락합니다.\n\n" +
+                "페어링 후에는 앱을 열면 마지막 PC에 자동으로 연결됩니다. 다른 PC로 바꾸려면 그 PC의 블루투스 설정에서 이 폰을 연결하세요.\n\n" +
                 "※ 예전에 이 폰을 PC와 '휴대폰'으로 페어링했다면, Windows에서 그 장치를 먼저 제거한 뒤 다시 추가하세요."
         ))
         col.addView(Button(this).apply {
@@ -611,17 +558,6 @@ class MainActivity : Activity(), HidManager.Listener {
             isAllCaps = false
             setOnClickListener { requestDiscoverable() }
         }, marginTop(8))
-
-        // 2. 연결
-        col.addView(sectionTitle("2. 연결할 PC 선택"))
-        col.addView(bodyText("연결되면 화면이 흰색 트랙패드로 바뀝니다. 다음부터는 앱을 열면 마지막 PC에 자동으로 연결합니다."))
-        deviceList = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
-        col.addView(deviceList, marginTop(8))
-        col.addView(Button(this).apply {
-            text = "목록 새로고침"
-            isAllCaps = false
-            setOnClickListener { refreshDevices() }
-        })
 
         // 설정
         col.addView(sectionTitle("포인터 및 스크롤"))
@@ -631,11 +567,12 @@ class MainActivity : Activity(), HidManager.Listener {
         col.addView(toggle("관성 스크롤", settings.inertia) { settings.inertia = it })
 
         col.addView(sectionTitle("클릭"))
+        col.addView(toggle("화면 아래 큰 클릭 버튼 표시", settings.showClickButtons) { settings.showClickButtons = it })
+        col.addView(bodyText("큰 버튼은 실제 마우스 버튼처럼 동작합니다. 짧게 누르면 클릭, 꾹 누른 채 다른 손가락으로 트랙패드를 움직이면 드래그입니다."))
         col.addView(toggle("1손가락 탭으로 클릭", settings.tapToClick) { settings.tapToClick = it })
         col.addView(toggle("탭 후 눌러 끌기로 드래그", settings.tapDrag) { settings.tapDrag = it })
         col.addView(toggle("2손가락 탭으로 오른쪽 클릭", settings.twoFingerRightClick) { settings.twoFingerRightClick = it })
         col.addView(toggle("3손가락 탭으로 가운데 클릭", settings.threeFingerMiddleClick) { settings.threeFingerMiddleClick = it })
-        col.addView(toggle("화면 아래 큰 클릭 버튼 표시", settings.showClickButtons) { settings.showClickButtons = it })
         col.addView(bodyText("※ '1손가락 탭으로 클릭'을 끄면 큰 클릭 버튼이 자동으로 표시됩니다."))
 
         col.addView(sectionTitle("기타"))
@@ -644,7 +581,7 @@ class MainActivity : Activity(), HidManager.Listener {
         col.addView(bodyText("설정은 트랙패드 화면을 다시 열 때 적용됩니다."))
 
         // 제스처 안내
-        col.addView(sectionTitle("제스처"))
+        col.addView(sectionTitle("제스처 (트랙패드는 가로 화면)"))
         col.addView(bodyText(
             "• 1손가락 이동: 커서 이동\n" +
                 "• 1손가락 탭: 클릭  /  두 번 탭: 더블클릭\n" +
@@ -660,6 +597,16 @@ class MainActivity : Activity(), HidManager.Listener {
                 "• 뒤로 버튼 또는 오른쪽 위 '설정': 연결을 유지한 채 이 화면으로\n" +
                 "• 오른쪽 위 '일시정지': 연결은 유지하고 입력만 멈춤"
         ))
+
+        // 완전 종료
+        col.addView(Button(this).apply {
+            text = "앱 완전히 종료 (연결 끊기)"
+            isAllCaps = false
+            setOnClickListener {
+                val s = service
+                if (s != null) s.quit() else finishAndRemoveTask()
+            }
+        }, marginTop(24))
 
         return ScrollView(this).apply {
             fitsSystemWindows = true
