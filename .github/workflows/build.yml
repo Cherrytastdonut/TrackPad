@@ -6,6 +6,9 @@ on:
   pull_request:
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -23,8 +26,21 @@ jobs:
         run: |
           chmod +x gradlew
           ./gradlew assembleDebug --no-daemon
+          cp app/build/outputs/apk/debug/app-debug.apk WinTrackpad.apk
 
       - uses: actions/upload-artifact@v4
         with:
           name: WinTrackpad-apk
-          path: app/build/outputs/apk/debug/app-debug.apk
+          path: WinTrackpad.apk
+
+      # main에 푸시할 때마다 'latest' 릴리스의 APK를 교체 → 폰에서 바로 받기 쉬움
+      - name: Publish to "latest" release
+        if: github.event_name != 'pull_request'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release delete latest --yes --cleanup-tag || true
+          gh release create latest WinTrackpad.apk \
+            --title "WinTrackpad (최신 빌드)" \
+            --notes "폰에서 WinTrackpad.apk를 받아 설치하세요. 커밋: ${GITHUB_SHA::7}" \
+            --target "$GITHUB_SHA"

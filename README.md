@@ -43,9 +43,11 @@
 
 ## APK 받기
 
-`main` 브랜치에 푸시할 때마다 GitHub Actions가 APK를 빌드합니다.
-저장소의 **Actions → Build APK → 최근 실행 → Artifacts → WinTrackpad-apk** 에서 내려받아 폰에 설치하세요.
-(설치할 때 "출처를 알 수 없는 앱" 허용이 필요합니다.)
+`main` 브랜치에 푸시할 때마다 GitHub Actions가 APK를 빌드해 **Releases → latest** 에 올립니다.
+
+폰 브라우저에서 아래 주소를 열고 `WinTrackpad.apk`를 받아 설치하세요. (설치할 때 "출처를 알 수 없는 앱" 허용이 필요합니다.)
+
+https://github.com/Cherrytastdonut/TrackPad/releases/latest
 
 ## 직접 빌드
 
