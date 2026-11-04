@@ -19,7 +19,6 @@ import android.os.Build
 import android.os.Bundle
 import android.os.IBinder
 import android.view.Gravity
-import android.view.MotionEvent
 import android.view.View
 import android.view.ViewGroup
 import android.view.WindowInsets
@@ -33,7 +32,7 @@ import android.widget.SeekBar
 import android.widget.Switch
 import android.widget.TextView
 
-@SuppressLint("MissingPermission", "SetTextI18n", "UseSwitchCompatOrMaterialCode", "ClickableViewAccessibility")
+@SuppressLint("MissingPermission", "SetTextI18n", "UseSwitchCompatOrMaterialCode")
 class MainActivity : Activity(), HidManager.Listener {
 
     private companion object {
@@ -58,7 +57,6 @@ class MainActivity : Activity(), HidManager.Listener {
     private var trackpad: TrackpadView? = null
     private var pauseButton: TextView? = null
     private var healthBanner: TextView? = null
-    private var dragLockButton: Button? = null
 
     private var trackpadShown = false
 
@@ -274,10 +272,7 @@ class MainActivity : Activity(), HidManager.Listener {
         val pad = TrackpadView(this, h, settings)
         trackpad = pad
 
-        val column = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
-        column.addView(pad, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
-        if (settings.clickButtonsVisible) column.addView(buildClickBar(h, pad))
-        frame.addView(column, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
+        frame.addView(pad, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
 
         // 오른쪽 위: 일시정지 / 설정 (옅은 색, 작게)
         val topBar = LinearLayout(this).apply {
@@ -331,64 +326,6 @@ class MainActivity : Activity(), HidManager.Listener {
         hid?.releaseAll()
         pauseButton?.text = if (p) "다시 시작" else "일시정지"
         pad.setBackgroundColor(if (p) 0xFFEDEDED.toInt() else Color.WHITE)
-        updateDragLockButton(false)
-    }
-
-    /**
-     * 큰 클릭 버튼: 실제 마우스 버튼처럼 손가락이 닿으면 눌리고, 떼면 떨어진다.
-     * 짧게 누르면 클릭, 꾹 누르고 다른 손가락으로 트랙패드를 움직이면 드래그.
-     */
-    private fun buildClickBar(h: HidManager, pad: TrackpadView): View {
-        val bar = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            setPadding(px(16), px(6), px(16), px(10))
-            setBackgroundColor(0xFFF2F2F2.toInt())
-        }
-        fun add(v: View, weight: Float) =
-            bar.addView(v, LinearLayout.LayoutParams(0, px(64), weight).apply { setMargins(px(4), 0, px(4), 0) })
-
-        add(holdButton("왼쪽 클릭", HidManager.BTN_LEFT, h, pad), 2f)
-        dragLockButton = Button(this).apply {
-            text = "끌기 고정"
-            isAllCaps = false
-            setOnClickListener {
-                if (pad.paused) return@setOnClickListener
-                val lock = !pad.dragLocked
-                pad.dragLocked = lock
-                h.setButtons(if (lock) HidManager.BTN_LEFT else 0)
-                Haptics.perform(pad, if (lock) Haptic.DRAG_START else Haptic.DRAG_END, settings.hapticFeedback)
-                updateDragLockButton(lock)
-            }
-        }.also { add(it, 1f) }
-        add(holdButton("오른쪽 클릭", HidManager.BTN_RIGHT, h, pad), 2f)
-        pad.onDragLockReleased = { updateDragLockButton(false) }
-        return bar
-    }
-
-    private fun holdButton(label: String, btn: Int, h: HidManager, pad: TrackpadView) = Button(this).apply {
-        text = label
-        isAllCaps = false
-        setOnTouchListener { v, e ->
-            when (e.actionMasked) {
-                MotionEvent.ACTION_DOWN -> {
-                    if (!pad.paused) {
-                        h.setHeld(btn, true)
-                        Haptics.perform(pad, Haptic.CLICK, settings.hapticFeedback)
-                    }
-                    v.isPressed = true
-                }
-                MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
-                    h.setHeld(btn, false)
-                    if (!pad.paused) Haptics.perform(pad, Haptic.DRAG_END, settings.hapticFeedback)
-                    v.isPressed = false
-                }
-            }
-            true
-        }
-    }
-
-    private fun updateDragLockButton(locked: Boolean) {
-        dragLockButton?.text = if (locked) "놓기" else "끌기 고정"
     }
 
     private fun cornerButton(t: String, onClick: () -> Unit) = TextView(this).apply {
@@ -567,13 +504,12 @@ class MainActivity : Activity(), HidManager.Listener {
         col.addView(toggle("관성 스크롤", settings.inertia) { settings.inertia = it })
 
         col.addView(sectionTitle("클릭"))
-        col.addView(toggle("화면 아래 큰 클릭 버튼 표시", settings.showClickButtons) { settings.showClickButtons = it })
-        col.addView(bodyText("큰 버튼은 실제 마우스 버튼처럼 동작합니다. 짧게 누르면 클릭, 꾹 누른 채 다른 손가락으로 트랙패드를 움직이면 드래그입니다."))
         col.addView(toggle("1손가락 탭으로 클릭", settings.tapToClick) { settings.tapToClick = it })
+        col.addView(toggle("꾹 눌러 끌기", settings.longPressDrag) { settings.longPressDrag = it })
+        col.addView(bodyText("한 손가락으로 가만히 꾹 누르면 진동이 한 번 오고 왼쪽 버튼이 눌린 상태가 됩니다. 그대로 움직이면 끌기, 손가락을 떼면 놓기입니다."))
         col.addView(toggle("탭 후 눌러 끌기로 드래그", settings.tapDrag) { settings.tapDrag = it })
         col.addView(toggle("2손가락 탭으로 오른쪽 클릭", settings.twoFingerRightClick) { settings.twoFingerRightClick = it })
         col.addView(toggle("3손가락 탭으로 가운데 클릭", settings.threeFingerMiddleClick) { settings.threeFingerMiddleClick = it })
-        col.addView(bodyText("※ '1손가락 탭으로 클릭'을 끄면 큰 클릭 버튼이 자동으로 표시됩니다."))
 
         col.addView(sectionTitle("기타"))
         col.addView(toggle("진동 피드백", settings.hapticFeedback) { settings.hapticFeedback = it })
@@ -585,6 +521,7 @@ class MainActivity : Activity(), HidManager.Listener {
         col.addView(bodyText(
             "• 1손가락 이동: 커서 이동\n" +
                 "• 1손가락 탭: 클릭  /  두 번 탭: 더블클릭\n" +
+                "• 꾹 누르기(진동) 후 이동: 끌기, 떼면 놓기\n" +
                 "• 탭 후 바로 눌러서 이동: 드래그\n" +
                 "• 2손가락 탭: 오른쪽 클릭\n" +
                 "• 2손가락 이동: 스크롤 (튕기면 관성 스크롤, 다시 닿으면 멈춤)\n" +

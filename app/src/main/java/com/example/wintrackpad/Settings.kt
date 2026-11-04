@@ -48,13 +48,10 @@ class Settings(context: Context) {
         get() = bool("threeFingerMiddleClick", true)
         set(v) = putBool("threeFingerMiddleClick", v)
 
-    /** 화면 아래 큰 클릭 버튼 줄 (탭 클릭을 끄면 자동으로 표시) */
-    var showClickButtons: Boolean
-        get() = bool("showClickButtons", true)
-        set(v) = putBool("showClickButtons", v)
-
-    /** 실제로 버튼 줄을 보여줄지: 탭 클릭이 꺼져 있으면 클릭 수단이 없어지므로 강제로 표시 */
-    val clickButtonsVisible: Boolean get() = showClickButtons || !tapToClick
+    /** 한 손가락으로 가만히 꾹 누르면 왼쪽 버튼 누름 → 이동하면 끌기, 떼면 놓기 */
+    var longPressDrag: Boolean
+        get() = bool("longPressDrag", true)
+        set(v) = putBool("longPressDrag", v)
 
     var hapticFeedback: Boolean
         get() = bool("haptic", true)

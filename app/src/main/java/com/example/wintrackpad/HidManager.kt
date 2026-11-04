@@ -145,12 +145,10 @@ class HidManager(private val context: Context, private val listener: Listener) {
     private var pdy = 0
     private var pWheel = 0
     private var pPan = 0
-    /** 실제로 호스트에 보고된 버튼 상태 = gestureButtons | heldButtons */
+    /** 실제로 호스트에 보고된 버튼 상태 */
     private var buttons = 0
     /** 트랙패드 제스처가 누른 버튼 */
     private var gestureButtons = 0
-    /** 화면의 큰 버튼을 손가락으로 누르고 있는 동안 눌린 버튼 */
-    private var heldButtons = 0
     private var mods = 0
     private var epoch = 0
     private var flushPosted = false
@@ -335,7 +333,7 @@ class HidManager(private val context: Context, private val listener: Listener) {
     private fun resetConnectionState() {
         synchronized(lock) {
             pdx = 0; pdy = 0; pWheel = 0; pPan = 0
-            buttons = 0; gestureButtons = 0; heldButtons = 0; mods = 0
+            buttons = 0; gestureButtons = 0; mods = 0
             epoch++
             flushPosted = false
             session++
@@ -393,16 +391,8 @@ class HidManager(private val context: Context, private val listener: Listener) {
         }
     }
 
-    /** 큰 버튼: 손가락이 닿아 있는 동안 버튼이 눌린 상태로 유지된다 */
-    fun setHeld(btn: Int, down: Boolean) {
-        synchronized(lock) {
-            heldButtons = if (down) heldButtons or btn else heldButtons and btn.inv()
-            applyButtonsLocked()
-        }
-    }
-
     private fun applyButtonsLocked() {
-        val b = gestureButtons or heldButtons
+        val b = gestureButtons
         if (b == buttons) return
         run {
             val pending = takeMouseReportLocked()
@@ -453,7 +443,6 @@ class HidManager(private val context: Context, private val listener: Listener) {
     fun releaseAll() {
         synchronized(lock) {
             gestureButtons = 0
-            heldButtons = 0
             applyButtonsLocked()
         }
         val needKeyRelease = synchronized(lock) { mods != 0 }

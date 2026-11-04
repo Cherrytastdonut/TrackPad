@@ -22,6 +22,7 @@ import kotlin.math.min
  *
  *  1손가락 이동        커서 이동 (가속 적용)
  *  1손가락 탭          왼쪽 클릭
+ *  꾹 누르기(진동)     왼쪽 버튼 누름 → 이동하면 끌기, 떼면 놓기
  *  탭 → 바로 눌러 끌기  드래그 (왼쪽 버튼 누른 채 이동)
  *  2손가락 탭          오른쪽 클릭
  *  2손가락 이동        스크롤 (관성 포함)
@@ -55,6 +56,8 @@ class TrackpadView(
         const val TAP_MS = 200L
         const val MULTI_TAP_MS = 280L
         const val DOUBLE_TAP_MS = 300L
+        /** 가만히 이만큼 누르고 있으면 왼쪽 버튼이 눌린다 */
+        const val LONG_PRESS_MS = 450L
 
         /** 포인터: dp당 HID 카운트 기본값 */
         const val POINTER_BASE = 1.4f
@@ -75,6 +78,7 @@ class TrackpadView(
     private val threeFingerMiddleClick = settings.threeFingerMiddleClick
     private val windows11 = settings.windows11
     private val inertia = settings.inertia
+    private val longPressDrag = settings.longPressDrag
     private val haptics = settings.hapticFeedback
 
     /** true면 모든 터치를 무시 (연결은 유지) */
@@ -84,11 +88,7 @@ class TrackpadView(
             field = v
         }
 
-    /** 화면 아래 '끌기 고정' 버튼이 왼쪽 버튼을 누르고 있는 상태 */
-    var dragLocked = false
-
-    /** 끌기 고정 중 탭으로 놓았을 때 알림 (버튼 UI 갱신용) */
-    var onDragLockReleased: (() -> Unit)? = null
+    private val longPressRunnable = Runnable { onLongPress() }
 
     // 임계값 (px)
     private val tapSlop = 10 * dp
@@ -212,13 +212,27 @@ class TrackpadView(
             mode = Mode.STOP_TOUCH
             return
         }
-        tapDragArmed = tapDrag && !dragLocked &&
+        tapDragArmed = tapDrag &&
             e.eventTime - lastTapUp < DOUBLE_TAP_MS &&
             hypot(e.x - lastTapX, e.y - lastTapY) < doubleTapMaxDist
         mode = Mode.POINTER
+        if (longPressDrag) postDelayed(longPressRunnable, LONG_PRESS_MS)
     }
 
+    /** 한 손가락으로 가만히 꾹 눌렀을 때: 진동 1회 + 왼쪽 버튼 누름. 떼면 놓는다. */
+    private fun onLongPress() {
+        if (paused || mode != Mode.POINTER || maxPointers != 1 || maxDisp > tapSlop) return
+        tapDragArmed = false
+        committed = true
+        mode = Mode.DRAG
+        hid.setButtons(HidManager.BTN_LEFT)
+        haptic(Haptic.DRAG_START)
+    }
+
+    private fun cancelLongPress() = removeCallbacks(longPressRunnable)
+
     private fun onPointerDown(e: MotionEvent) {
+        cancelLongPress()
         recordDown(e, e.actionIndex)
         maxPointers = max(maxPointers, e.pointerCount)
         val n = e.pointerCount
@@ -264,6 +278,7 @@ class TrackpadView(
             }
 
             Mode.POINTER -> {
+                if (maxDisp > tapSlop) cancelLongPress()
                 if (tapDragArmed && maxDisp > tapSlop) {
                     tapDragArmed = false
                     committed = true
@@ -389,18 +404,13 @@ class TrackpadView(
     }
 
     private fun onLastUp(e: MotionEvent) {
+        cancelLongPress()
         val dur = e.eventTime - downTime
 
         when (mode) {
             Mode.POINTER -> {
                 val isTap = !committed && maxPointers == 1 && dur < TAP_MS && maxDisp < tapSlop
-                if (isTap && dragLocked) {
-                    // 끌기 고정 중의 탭 = 놓기
-                    dragLocked = false
-                    hid.setButtons(0)
-                    haptic(Haptic.DRAG_END)
-                    onDragLockReleased?.invoke()
-                } else if (isTap && tapToClick) {
+                if (isTap && tapToClick) {
                     hid.click(HidManager.BTN_LEFT)
                     haptic(Haptic.CLICK)
                     lastTapUp = e.eventTime
@@ -431,19 +441,15 @@ class TrackpadView(
     fun cancelAll() {
         stopFling()
         cancelGesture()
-        if (dragLocked) {
-            dragLocked = false
-            onDragLockReleased?.invoke()
-        }
         hid.releaseAll()
     }
 
     private fun endDrag() {
         hid.setButtons(0)
-        haptic(Haptic.DRAG_END)
     }
 
     private fun cancelGesture() {
+        cancelLongPress()
         when (mode) {
             Mode.DRAG -> hid.setButtons(0)
             Mode.PINCH, Mode.SWIPE_SWITCH -> hid.keyboard(0)
