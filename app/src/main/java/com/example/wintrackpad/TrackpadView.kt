@@ -8,7 +8,6 @@ import android.graphics.Rect
 import android.os.Build
 import android.util.SparseArray
 import android.view.Choreographer
-import android.view.HapticFeedbackConstants
 import android.view.MotionEvent
 import android.view.VelocityTracker
 import android.view.View
@@ -32,7 +31,9 @@ import kotlin.math.min
  *  3/4손가락 위        작업 보기 (Win+Tab)
  *  3/4손가락 아래      바탕 화면 보기 (Win+D)
  *  4손가락 좌/우       가상 데스크톱 전환 (Ctrl+Win+←/→)
- *  4손가락 탭          알림 센터 (Win+A)
+ *  4손가락 탭          알림 센터 (Windows 11: Win+N, Windows 10: Win+A)
+ *
+ *  관성 스크롤 중 첫 접촉은 '멈춤 전용'이며 클릭을 만들지 않는다.
  */
 @SuppressLint("ViewConstructor", "ClickableViewAccessibility")
 class TrackpadView(
@@ -43,7 +44,9 @@ class TrackpadView(
 
     private enum class Mode {
         IDLE, POINTER, DRAG, TWO_PENDING, SCROLL, PINCH,
-        SWIPE_PENDING, SWIPE_SWITCH, SWIPE_DONE, WAIT_LIFT
+        SWIPE_PENDING, SWIPE_SWITCH, SWIPE_DONE, WAIT_LIFT,
+        /** 관성을 멈추려고 닿은 손가락. 움직이면 POINTER로 바뀌지만 클릭은 하지 않는다. */
+        STOP_TOUCH
     }
 
     private enum class Axis { FREE, VERTICAL, HORIZONTAL }
@@ -67,7 +70,25 @@ class TrackpadView(
     private val scrollSpeed = settings.scrollSpeed
     private val natural = settings.naturalScroll
     private val tapToClick = settings.tapToClick
+    private val tapDrag = settings.tapDrag
+    private val twoFingerRightClick = settings.twoFingerRightClick
+    private val threeFingerMiddleClick = settings.threeFingerMiddleClick
+    private val windows11 = settings.windows11
+    private val inertia = settings.inertia
     private val haptics = settings.hapticFeedback
+
+    /** true면 모든 터치를 무시 (연결은 유지) */
+    var paused = false
+        set(v) {
+            if (v && !field) cancelAll()
+            field = v
+        }
+
+    /** 화면 아래 '끌기 고정' 버튼이 왼쪽 버튼을 누르고 있는 상태 */
+    var dragLocked = false
+
+    /** 끌기 고정 중 탭으로 놓았을 때 알림 (버튼 UI 갱신용) */
+    var onDragLockReleased: (() -> Unit)? = null
 
     // 임계값 (px)
     private val tapSlop = 10 * dp
@@ -150,6 +171,7 @@ class TrackpadView(
     // ------------------------------------------------------------------
 
     override fun onTouchEvent(e: MotionEvent): Boolean {
+        if (paused) return true
         val tracker = vt ?: VelocityTracker.obtain().also { vt = it }
         if (e.actionMasked == MotionEvent.ACTION_DOWN) tracker.clear()
         tracker.addMovement(e)
@@ -166,6 +188,7 @@ class TrackpadView(
     }
 
     private fun onFirstDown(e: MotionEvent) {
+        val wasFlinging = flinging
         stopFling()
         downPos.clear()
         recordDown(e, 0)
@@ -181,7 +204,15 @@ class TrackpadView(
         maxDisp = 0f
         committed = false
         pendingFling = false
-        tapDragArmed = tapToClick &&
+        if (wasFlinging) {
+            // 관성만 멈추는 접촉: 이번 제스처에서는 클릭·드래그를 만들지 않는다
+            tapDragArmed = false
+            committed = true
+            lastTapUp = 0L
+            mode = Mode.STOP_TOUCH
+            return
+        }
+        tapDragArmed = tapDrag && !dragLocked &&
             e.eventTime - lastTapUp < DOUBLE_TAP_MS &&
             hypot(e.x - lastTapX, e.y - lastTapY) < doubleTapMaxDist
         mode = Mode.POINTER
@@ -220,13 +251,25 @@ class TrackpadView(
         updateMaxDisp(e)
 
         when (mode) {
+            Mode.STOP_TOUCH -> {
+                if (maxDisp > tapSlop) {
+                    // 멈춘 뒤 그대로 움직이면 커서 이동 (클릭은 여전히 억제)
+                    val i = e.findPointerIndex(activeId)
+                    if (i >= 0) {
+                        lastX = e.getX(i); lastY = e.getY(i)
+                    }
+                    lastMoveTime = e.eventTime
+                    mode = Mode.POINTER
+                }
+            }
+
             Mode.POINTER -> {
                 if (tapDragArmed && maxDisp > tapSlop) {
                     tapDragArmed = false
                     committed = true
                     mode = Mode.DRAG
                     hid.setButtons(HidManager.BTN_LEFT)
-                    haptic()
+                    haptic(Haptic.DRAG_START)
                 }
                 movePointer(e)
             }
@@ -314,7 +357,7 @@ class TrackpadView(
 
         when (mode) {
             Mode.DRAG -> if (id == activeId) {
-                hid.setButtons(0)
+                endDrag()
                 mode = Mode.WAIT_LIFT
             }
             Mode.TWO_PENDING -> mode = Mode.WAIT_LIFT
@@ -350,15 +393,22 @@ class TrackpadView(
 
         when (mode) {
             Mode.POINTER -> {
-                if (tapToClick && maxPointers == 1 && dur < TAP_MS && maxDisp < tapSlop) {
+                val isTap = !committed && maxPointers == 1 && dur < TAP_MS && maxDisp < tapSlop
+                if (isTap && dragLocked) {
+                    // 끌기 고정 중의 탭 = 놓기
+                    dragLocked = false
+                    hid.setButtons(0)
+                    haptic(Haptic.DRAG_END)
+                    onDragLockReleased?.invoke()
+                } else if (isTap && tapToClick) {
                     hid.click(HidManager.BTN_LEFT)
-                    haptic()
+                    haptic(Haptic.CLICK)
                     lastTapUp = e.eventTime
                     lastTapX = e.x
                     lastTapY = e.y
                 }
             }
-            Mode.DRAG -> hid.setButtons(0)
+            Mode.DRAG -> endDrag()
             Mode.PINCH -> hid.keyboard(0)
             Mode.SWIPE_SWITCH -> hid.keyboard(0) // Alt 떼기 → 선택한 창으로 전환
             Mode.SCROLL -> {
@@ -366,7 +416,7 @@ class TrackpadView(
                 startFling()
             }
             Mode.TWO_PENDING, Mode.SWIPE_PENDING, Mode.WAIT_LIFT -> {
-                if (!committed && tapToClick && dur < MULTI_TAP_MS && maxDisp < multiTapSlop) {
+                if (!committed && dur < MULTI_TAP_MS && maxDisp < multiTapSlop) {
                     multiFingerTap(maxPointers)
                 }
                 if (pendingFling && e.eventTime - scrollLiftTime < 120) startFling()
@@ -375,6 +425,22 @@ class TrackpadView(
         }
         pendingFling = false
         mode = Mode.IDLE
+    }
+
+    /** 진행 중인 제스처·관성을 모두 끝내고 눌린 버튼·키를 뗀다 (앱 전환, 일시정지 등) */
+    fun cancelAll() {
+        stopFling()
+        cancelGesture()
+        if (dragLocked) {
+            dragLocked = false
+            onDragLockReleased?.invoke()
+        }
+        hid.releaseAll()
+    }
+
+    private fun endDrag() {
+        hid.setButtons(0)
+        haptic(Haptic.DRAG_END)
     }
 
     private fun cancelGesture() {
@@ -435,12 +501,13 @@ class TrackpadView(
 
     private fun multiFingerTap(fingers: Int) {
         when (fingers) {
-            2 -> hid.click(HidManager.BTN_RIGHT)
-            3 -> hid.click(HidManager.BTN_MIDDLE)
-            4 -> hid.keyCombo(HidManager.MOD_WIN, HidManager.KEY_A)
+            2 -> if (twoFingerRightClick) hid.click(HidManager.BTN_RIGHT) else return
+            3 -> if (threeFingerMiddleClick) hid.click(HidManager.BTN_MIDDLE) else return
+            // 알림 센터: Windows 11은 Win+N, Windows 10은 Win+A
+            4 -> hid.keyCombo(HidManager.MOD_WIN, if (windows11) HidManager.KEY_N else HidManager.KEY_A)
             else -> return
         }
-        haptic()
+        haptic(Haptic.CLICK)
     }
 
     private fun commitSwipe(dx: Float, dy: Float, c: PointF) {
@@ -464,7 +531,7 @@ class TrackpadView(
             else hid.keyCombo(HidManager.MOD_WIN, HidManager.KEY_D)            // 바탕 화면
             mode = Mode.SWIPE_DONE
         }
-        haptic()
+        haptic(Haptic.GESTURE)
     }
 
     private fun altTab(forward: Boolean) {
@@ -499,7 +566,7 @@ class TrackpadView(
     }
 
     private fun startFling() {
-        if (hypot(flingVx, flingVy) < flingMinStart) return
+        if (!inertia || hypot(flingVx, flingVy) < flingMinStart) return
         flinging = true
         lastFrameNs = System.nanoTime()
         choreographer.removeFrameCallback(frameCallback)
@@ -533,9 +600,7 @@ class TrackpadView(
     // 유틸
     // ------------------------------------------------------------------
 
-    private fun haptic() {
-        if (haptics) performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY)
-    }
+    private fun haptic(kind: Haptic) = Haptics.perform(this, kind, haptics)
 
     private fun recordDown(e: MotionEvent, index: Int) {
         downPos.put(e.getPointerId(index), PointF(e.getX(index), e.getY(index)))

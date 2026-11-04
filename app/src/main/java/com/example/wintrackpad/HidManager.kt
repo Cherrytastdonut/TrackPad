@@ -10,6 +10,7 @@ import android.bluetooth.BluetoothProfile
 import android.content.Context
 import android.os.Handler
 import android.os.HandlerThread
+import android.os.Looper
 
 /**
  * 폰을 블루투스 HID 장치(마우스 + 키보드 복합 장치)로 등록하고 리포트를 보낸다.
@@ -18,8 +19,12 @@ import android.os.HandlerThread
  * 마우스 리포트(ID 1, 9바이트): [버튼, X(16bit), Y(16bit), 휠(16bit), 가로휠(16bit)]
  * 키보드 리포트(ID 2, 8바이트): [수정키, 0, 키1..키6]
  *
- * 휠에는 "Resolution Multiplier"(고해상도 스크롤)를 넣어 두었다. Windows가 이를 켜면
- * 휠 1단위 = 1/120 칸이 되어 맥처럼 부드럽게 스크롤된다. 켜지 않으면 자동으로 칸 단위로 보낸다.
+ * 순서·안정성 규칙
+ *  - 모든 전송은 단일 sender 스레드에서 순서대로 실행된다.
+ *  - 연결마다 session 번호가 바뀌며, 이전 연결에서 쌓인 작업은 새 연결로 보내지 않는다.
+ *  - 종료/연결 해제 시 버튼·키 해제 리포트를 먼저 보낸 뒤 정리한다.
+ *  - 버튼·키 상태 리포트는 실패 시 한 번 재전송한다(상태값이라 중복 동작이 생기지 않음).
+ *    이동량이 담긴 리포트는 재전송하지 않는다(커서가 두 번 움직이므로).
  */
 @SuppressLint("MissingPermission")
 class HidManager(private val context: Context, private val listener: Listener) {
@@ -27,8 +32,11 @@ class HidManager(private val context: Context, private val listener: Listener) {
     interface Listener {
         fun onHidStatus(message: String)
         fun onHidReady()
+        fun onHidUnregistered()
         fun onHostConnected(device: BluetoothDevice)
         fun onHostDisconnected()
+        /** 연속 전송 실패(false) / 회복(true) */
+        fun onSendHealthChanged(healthy: Boolean)
     }
 
     companion object {
@@ -46,12 +54,14 @@ class HidManager(private val context: Context, private val listener: Listener) {
 
         const val KEY_A = 0x04
         const val KEY_D = 0x07
+        const val KEY_N = 0x11
         const val KEY_TAB = 0x2B
         const val KEY_RIGHT = 0x4F
         const val KEY_LEFT = 0x50
 
-        /** 휠 1칸(notch)에 해당하는 고해상도 단위 */
-        const val UNITS_PER_NOTCH = 120
+        const val UNITS_PER_NOTCH = ScrollAccumulator.UNITS_PER_NOTCH
+
+        private const val FAIL_STREAK_UNHEALTHY = 5
 
         private fun bytes(vararg v: Int) = ByteArray(v.size) { v[it].toByte() }
 
@@ -110,11 +120,19 @@ class HidManager(private val context: Context, private val listener: Listener) {
     @Volatile private var hid: BluetoothHidDevice? = null
     @Volatile var host: BluetoothDevice? = null
         private set
-    var isRegistered = false
+    @Volatile var isRegistered = false
         private set
+    /** 프로필 프록시가 끊겨 이 객체로는 복구할 수 없는 상태 */
+    @Volatile var isProxyLost = false
+        private set
+    @Volatile private var stopped = false
+
+    /** 연결이 바뀔 때마다 증가. 작업은 만들어질 때의 값을 들고 다닌다. */
+    @Volatile private var session = 0
 
     private val senderThread = HandlerThread("hid-sender").also { it.start() }
     private val sender = Handler(senderThread.looper)
+    private val main = Handler(Looper.getMainLooper())
 
     /** 호스트가 SET_REPORT(Feature)로 설정하는 값. bit0-1: 세로휠 배율, bit2-3: 가로휠 배율 */
     @Volatile private var featureValue = 0
@@ -128,12 +146,17 @@ class HidManager(private val context: Context, private val listener: Listener) {
     private var pWheel = 0
     private var pPan = 0
     private var buttons = 0
+    private var mods = 0
     private var epoch = 0
     private var flushPosted = false
 
-    // 메인 스레드 전용: 칸 단위로 보낼 때의 소수점 잔여
-    private var wheelAcc = 0f
-    private var panAcc = 0f
+    // 메인 스레드 전용
+    private val wheelAcc = ScrollAccumulator()
+    private val panAcc = ScrollAccumulator()
+
+    // sender 스레드 전용
+    private var failStreak = 0
+    private var unhealthy = false
 
     // ------------------------------------------------------------------
     // 시작 / 종료 / 연결
@@ -144,10 +167,21 @@ class HidManager(private val context: Context, private val listener: Listener) {
         return a.getProfileProxy(context, profileListener, BluetoothProfile.HID_DEVICE)
     }
 
+    /** 등록이 해제된 경우(예: 앱이 백그라운드로 갔을 때) 다시 등록한다. */
+    fun ensureRegistered(): Boolean {
+        if (stopped || isRegistered) return isRegistered
+        val h = hid ?: return false
+        return registerApp(h)
+    }
+
+    /** 버튼·키를 모두 뗀 뒤 등록 해제와 정리를 같은 순서 큐에서 실행한다. */
     fun stop() {
+        if (stopped) return
         releaseAll()
+        stopped = true
         val h = hid
         sender.post {
+            sleepQuietly(30)
             try {
                 h?.unregisterApp()
             } catch (_: Exception) {
@@ -156,10 +190,10 @@ class HidManager(private val context: Context, private val listener: Listener) {
                 adapter?.closeProfileProxy(BluetoothProfile.HID_DEVICE, h)
             } catch (_: Exception) {
             }
+            hid = null
+            host = null
             senderThread.quitSafely()
         }
-        hid = null
-        host = null
     }
 
     fun connect(device: BluetoothDevice): Boolean = try {
@@ -168,12 +202,17 @@ class HidManager(private val context: Context, private val listener: Listener) {
         false
     }
 
+    /** 버튼·키 해제가 전송된 뒤에 연결을 끊는다. */
     fun disconnect() {
         releaseAll()
+        val h = hid ?: return
         val d = host ?: return
-        try {
-            hid?.disconnect(d)
-        } catch (_: Exception) {
+        sender.post {
+            sleepQuietly(20)
+            try {
+                h.disconnect(d)
+            } catch (_: Exception) {
+            }
         }
     }
 
@@ -183,49 +222,66 @@ class HidManager(private val context: Context, private val listener: Listener) {
         d?.address ?: "알 수 없는 기기"
     }
 
+    private fun registerApp(h: BluetoothHidDevice): Boolean {
+        val sdp = BluetoothHidDeviceAppSdpSettings(
+            "Phone Trackpad",
+            "Android phone as a Windows trackpad",
+            "WinTrackpad",
+            BluetoothHidDevice.SUBCLASS1_COMBO,
+            DESCRIPTOR
+        )
+        return try {
+            h.registerApp(sdp, null, null, context.mainExecutor, hidCallback)
+        } catch (e: Exception) {
+            false
+        }
+    }
+
     private val profileListener = object : BluetoothProfile.ServiceListener {
         override fun onServiceConnected(profile: Int, proxy: BluetoothProfile) {
-            if (profile != BluetoothProfile.HID_DEVICE) return
+            if (profile != BluetoothProfile.HID_DEVICE || stopped) return
             val h = proxy as BluetoothHidDevice
             hid = h
-            val sdp = BluetoothHidDeviceAppSdpSettings(
-                "Phone Trackpad",
-                "Android phone as a Windows trackpad",
-                "WinTrackpad",
-                BluetoothHidDevice.SUBCLASS1_COMBO,
-                DESCRIPTOR
-            )
-            val ok = try {
-                h.registerApp(sdp, null, null, context.mainExecutor, hidCallback)
-            } catch (e: Exception) {
-                false
+            isProxyLost = false
+            if (!registerApp(h)) {
+                listener.onHidStatus("HID 등록 요청이 거부되었습니다. 다른 블루투스 키보드/마우스 앱을 종료한 뒤 다시 시도하세요.")
             }
-            if (!ok) listener.onHidStatus("HID 등록 요청이 거부되었습니다. 다른 블루투스 키보드/마우스 앱을 종료한 뒤 다시 시도하세요.")
         }
 
         override fun onServiceDisconnected(profile: Int) {
+            if (stopped) return
+            resetConnectionState()
             hid = null
             isRegistered = false
+            isProxyLost = true
+            val hadHost = host != null
             host = null
-            listener.onHidStatus("블루투스 HID 서비스가 중단되었습니다.")
+            if (hadHost) listener.onHostDisconnected()
+            listener.onHidUnregistered()
         }
     }
 
     private val hidCallback = object : BluetoothHidDevice.Callback() {
         override fun onAppStatusChanged(pluggedDevice: BluetoothDevice?, registered: Boolean) {
+            if (stopped) return
             isRegistered = registered
-            if (registered) listener.onHidReady()
-            else listener.onHidStatus("HID 등록이 해제되었습니다.")
+            if (registered) {
+                listener.onHidReady()
+            } else {
+                resetConnectionState()
+                val hadHost = host != null
+                host = null
+                if (hadHost) listener.onHostDisconnected()
+                listener.onHidUnregistered()
+            }
         }
 
         override fun onConnectionStateChanged(device: BluetoothDevice, state: Int) {
+            if (stopped) return
             when (state) {
                 BluetoothProfile.STATE_CONNECTED -> {
+                    resetConnectionState()
                     host = device
-                    synchronized(lock) {
-                        pdx = 0; pdy = 0; pWheel = 0; pPan = 0; buttons = 0
-                    }
-                    wheelAcc = 0f; panAcc = 0f
                     listener.onHostConnected(device)
                 }
                 BluetoothProfile.STATE_CONNECTING ->
@@ -233,8 +289,8 @@ class HidManager(private val context: Context, private val listener: Listener) {
                 BluetoothProfile.STATE_DISCONNECTED -> {
                     val cur = host
                     if (cur == null || cur.address == device.address) {
+                        resetConnectionState()
                         host = null
-                        featureValue = 0
                         listener.onHostDisconnected()
                     }
                 }
@@ -249,9 +305,9 @@ class HidManager(private val context: Context, private val listener: Listener) {
                     type == BluetoothHidDevice.REPORT_TYPE_FEATURE && rid == ID_MOUSE ->
                         h.replyReport(device, type, id, byteArrayOf(featureValue.toByte()))
                     type == BluetoothHidDevice.REPORT_TYPE_INPUT && rid == ID_MOUSE ->
-                        h.replyReport(device, type, id, ByteArray(9))
+                        h.replyReport(device, type, id, ByteArray(HidReports.MOUSE_REPORT_SIZE))
                     type == BluetoothHidDevice.REPORT_TYPE_INPUT && rid == ID_KEYBOARD ->
-                        h.replyReport(device, type, id, ByteArray(8))
+                        h.replyReport(device, type, id, ByteArray(HidReports.KEYBOARD_REPORT_SIZE))
                     else -> h.reportError(device, BluetoothHidDevice.ERROR_RSP_INVALID_RPT_ID)
                 }
             } catch (_: Exception) {
@@ -260,16 +316,28 @@ class HidManager(private val context: Context, private val listener: Listener) {
 
         override fun onSetReport(device: BluetoothDevice, type: Byte, id: Byte, data: ByteArray) {
             val h = hid ?: return
-            if (type == BluetoothHidDevice.REPORT_TYPE_FEATURE && id.toInt() == ID_MOUSE && data.isNotEmpty()) {
-                // 스택에 따라 앞에 Report ID가 붙어 오기도 한다
-                val v = if (data.size >= 2 && data[0].toInt() == ID_MOUSE) data[1] else data[0]
-                featureValue = v.toInt() and 0x0F
+            if (type == BluetoothHidDevice.REPORT_TYPE_FEATURE && id.toInt() == ID_MOUSE) {
+                HidReports.parseFeature(data, ID_MOUSE)?.let { featureValue = it }
             }
             try {
                 h.reportError(device, BluetoothHidDevice.ERROR_RSP_SUCCESS)
             } catch (_: Exception) {
             }
         }
+    }
+
+    /** 새 연결/끊김 시: 대기 입력 폐기, 상태 초기화, 이전 세션 작업 무효화 */
+    private fun resetConnectionState() {
+        synchronized(lock) {
+            pdx = 0; pdy = 0; pWheel = 0; pPan = 0
+            buttons = 0; mods = 0
+            epoch++
+            flushPosted = false
+            session++
+        }
+        featureValue = 0
+        wheelAcc.reset()
+        panAcc.reset()
     }
 
     // ------------------------------------------------------------------
@@ -286,14 +354,8 @@ class HidManager(private val context: Context, private val listener: Listener) {
 
     /** 스크롤. 단위는 1/120칸. v>0 = 위로, h>0 = 오른쪽으로 */
     fun scroll(vUnits: Float, hUnits: Float) {
-        wheelAcc += vUnits
-        panAcc += hUnits
-        val wd = if (hiResWheel) 1 else UNITS_PER_NOTCH
-        val pd = if (hiResPan) 1 else UNITS_PER_NOTCH
-        val w = (wheelAcc / wd).toInt()
-        val p = (panAcc / pd).toInt()
-        wheelAcc -= w * wd
-        panAcc -= p * pd
+        val w = wheelAcc.add(vUnits, hiResWheel)
+        val p = panAcc.add(hUnits, hiResPan)
         if (w == 0 && p == 0) return
         synchronized(lock) {
             pWheel += w; pPan += p
@@ -312,19 +374,21 @@ class HidManager(private val context: Context, private val listener: Listener) {
     }
 
     fun resetScrollRemainder() {
-        wheelAcc = 0f
-        panAcc = 0f
+        wheelAcc.reset()
+        panAcc.reset()
     }
+
+    val currentButtons: Int get() = synchronized(lock) { buttons }
 
     fun setButtons(b: Int) {
         synchronized(lock) {
             if (b == buttons) return
             val pending = takeMouseReportLocked()
             buttons = b
-            val btnReport = mouseReport(b, 0, 0, 0, 0)
-            postOrderedLocked {
-                pending?.let { send(ID_MOUSE, it) }
-                send(ID_MOUSE, btnReport)
+            val btnReport = HidReports.mouse(b, 0, 0, 0, 0)
+            postOrderedLocked { s ->
+                pending?.let { send(ID_MOUSE, it, s, retry = false) }
+                send(ID_MOUSE, btnReport, s, retry = true)
             }
         }
     }
@@ -346,22 +410,26 @@ class HidManager(private val context: Context, private val listener: Listener) {
         keySequence(mods to 0, mods to key, mods to 0, 0 to 0)
 
     fun keySequence(vararg states: Pair<Int, Int>) {
-        val reports = states.map { kbReport(it.first, it.second) }
+        if (states.isEmpty()) return
+        val reports = states.map { HidReports.keyboard(it.first, it.second) }
         synchronized(lock) {
+            mods = states.last().first
             val pending = takeMouseReportLocked()
-            postOrderedLocked {
-                pending?.let { send(ID_MOUSE, it) }
+            postOrderedLocked { s ->
+                pending?.let { send(ID_MOUSE, it, s, retry = false) }
                 reports.forEachIndexed { i, r ->
                     if (i > 0) sleepQuietly(6)
-                    send(ID_KEYBOARD, r)
+                    send(ID_KEYBOARD, r, s, retry = true)
                 }
             }
         }
     }
 
+    /** 눌린 버튼·수정키를 모두 뗀다. 이미 떼져 있으면 아무것도 보내지 않는다. */
     fun releaseAll() {
         setButtons(0)
-        keyboard(0)
+        val needKeyRelease = synchronized(lock) { mods != 0 }
+        if (needKeyRelease) keyboard(0)
     }
 
     // ------------------------------------------------------------------
@@ -372,10 +440,11 @@ class HidManager(private val context: Context, private val listener: Listener) {
         if (flushPosted) return
         flushPosted = true
         val e = epoch
-        sender.post { flush(e) }
+        val s = session
+        sender.post { flush(e, s) }
     }
 
-    private fun flush(e: Int) {
+    private fun flush(e: Int, s: Int) {
         val report: ByteArray? = synchronized(lock) {
             if (e != epoch) {
                 null // 순서가 중요한 리포트가 끼어들어 무효화됨
@@ -386,14 +455,15 @@ class HidManager(private val context: Context, private val listener: Listener) {
                 r
             }
         }
-        if (report != null) send(ID_MOUSE, report)
+        if (report != null) send(ID_MOUSE, report, s, retry = false)
     }
 
     /** 대기 중인 이동을 먼저 보내고, 그다음 block을 실행하도록 순서를 보장한다. */
-    private fun postOrderedLocked(block: () -> Unit) {
+    private fun postOrderedLocked(block: (session: Int) -> Unit) {
         epoch++
         flushPosted = false
-        sender.post(block)
+        val s = session
+        sender.post { block(s) }
         if (hasPendingLocked()) scheduleFlushLocked()
     }
 
@@ -406,26 +476,41 @@ class HidManager(private val context: Context, private val listener: Listener) {
         val w = pWheel.coerceIn(-32767, 32767)
         val p = pPan.coerceIn(-32767, 32767)
         pdx -= x; pdy -= y; pWheel -= w; pPan -= p
-        return mouseReport(buttons, x, y, w, p)
+        return HidReports.mouse(buttons, x, y, w, p)
     }
 
-    private fun mouseReport(b: Int, x: Int, y: Int, w: Int, p: Int) = byteArrayOf(
-        b.toByte(),
-        (x and 0xFF).toByte(), ((x shr 8) and 0xFF).toByte(),
-        (y and 0xFF).toByte(), ((y shr 8) and 0xFF).toByte(),
-        (w and 0xFF).toByte(), ((w shr 8) and 0xFF).toByte(),
-        (p and 0xFF).toByte(), ((p shr 8) and 0xFF).toByte()
-    )
-
-    private fun kbReport(mods: Int, key: Int) =
-        byteArrayOf(mods.toByte(), 0, key.toByte(), 0, 0, 0, 0, 0)
-
-    private fun send(id: Int, data: ByteArray) {
+    /** sender 스레드에서만 호출 */
+    private fun send(id: Int, data: ByteArray, s: Int, retry: Boolean) {
+        if (s != session) return // 이전 연결의 작업
         val h = hid ?: return
         val d = host ?: return
-        try {
-            h.sendReport(d, id, data)
-        } catch (_: Exception) {
+        var ok = trySend(h, d, id, data)
+        if (!ok && retry) {
+            sleepQuietly(25)
+            if (s == session) ok = trySend(h, d, id, data)
+        }
+        recordResult(ok)
+    }
+
+    private fun trySend(h: BluetoothHidDevice, d: BluetoothDevice, id: Int, data: ByteArray) = try {
+        h.sendReport(d, id, data)
+    } catch (_: Exception) {
+        false
+    }
+
+    private fun recordResult(ok: Boolean) {
+        if (ok) {
+            failStreak = 0
+            if (unhealthy) {
+                unhealthy = false
+                main.post { if (!stopped) listener.onSendHealthChanged(true) }
+            }
+        } else {
+            failStreak++
+            if (!unhealthy && failStreak >= FAIL_STREAK_UNHEALTHY) {
+                unhealthy = true
+                main.post { if (!stopped) listener.onSendHealthChanged(false) }
+            }
         }
     }
 

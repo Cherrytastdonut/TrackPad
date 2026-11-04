@@ -25,8 +25,12 @@
 | 3손가락 좌우 | 앱 전환 (Alt+Tab, 손을 떼면 선택) |
 | 3·4손가락 위 / 아래 | 작업 보기 (Win+Tab) / 바탕 화면 (Win+D) |
 | 4손가락 좌우 | 가상 데스크톱 전환 (Ctrl+Win+←/→) |
-| 4손가락 탭 | 알림 센터 (Win+A) |
-| 뒤로 버튼 두 번 | 연결 끊기 |
+| 4손가락 탭 | 알림 센터 (Windows 11: Win+N, Windows 10: Win+A) |
+
+- 관성 스크롤 중에 손가락을 대면 스크롤만 멈추고 클릭은 되지 않습니다.
+- 트랙패드 화면 오른쪽 위 **일시정지**는 연결을 유지하고 입력만 멈춥니다. **설정** 또는 뒤로 버튼을 누르면 연결을 유지한 채 설정 화면으로 갑니다.
+- 탭 클릭, 탭 드래그, 2·3손가락 탭은 각각 끌 수 있습니다. 탭 클릭을 끄면 화면 아래에 **왼쪽 클릭 / 끌기 시작·놓기 / 오른쪽 클릭** 큰 버튼이 자동으로 표시됩니다.
+- 진동은 클릭, 드래그 시작·끝, 다중 손가락 제스처, 연결, 전송 오류를 서로 다르게 알려 줍니다. (Android의 '터치 진동' 설정을 따릅니다.)
 
 스크롤은 HID "Resolution Multiplier"를 사용합니다. Windows가 이를 켜면 1/120칸 단위로 부드럽게 스크롤되고, 켜지 않으면 자동으로 칸 단위로 보냅니다.
 
@@ -43,19 +47,31 @@
 
 ## APK 받기
 
-`main` 브랜치에 푸시할 때마다 GitHub Actions가 APK를 빌드해 **Releases → latest** 에 올립니다.
+`main` 브랜치에 푸시할 때마다 GitHub Actions가 단위 테스트, lint, 빌드를 거쳐 버전별 릴리스(`v1.1.N`)를 만듭니다. 이전 버전 릴리스도 남아 있습니다.
 
 폰 브라우저에서 아래 주소를 열고 `WinTrackpad.apk`를 받아 설치하세요. (설치할 때 "출처를 알 수 없는 앱" 허용이 필요합니다.)
 
-https://github.com/Cherrytastdonut/TrackPad/releases/latest
+https://github.com/Cherrytastdonut/TrackPad/releases/latest/download/WinTrackpad.apk
+
+### 업데이트 설치를 위한 고정 서명 키
+
+같은 키로 서명된 APK끼리만 삭제 없이 업데이트할 수 있습니다. 저장소 **Settings → Secrets and variables → Actions** 에 아래 시크릿을 추가하면 CI가 고정 키로 서명합니다. 키 파일은 저장소에 넣지 않습니다.
+
+| 이름 | 값 |
+|---|---|
+| `SIGNING_KEYSTORE_BASE64` | 키스토어 파일(.jks)의 base64 문자열 |
+| `SIGNING_STORE_PASSWORD` | 키스토어 비밀번호 |
+| `SIGNING_KEY_ALIAS` | 키 별칭 |
+
+시크릿이 없으면 디버그 키로 서명되며, 이때는 업데이트 설치가 실패할 수 있습니다.
 
 ## 직접 빌드
 
 Android Studio에서 이 폴더를 열고 ▶ 실행하거나:
 
 ```bash
-./gradlew assembleDebug
-# 결과: app/build/outputs/apk/debug/app-debug.apk
+./gradlew testDebugUnitTest lintRelease assembleRelease
+# 결과: app/build/outputs/apk/release/app-release.apk
 ```
 
 ## 구조
@@ -63,7 +79,9 @@ Android Studio에서 이 폴더를 열고 ▶ 실행하거나:
 ```
 app/src/main/java/com/example/wintrackpad/
 ├── MainActivity.kt   연결 화면, 권한, 흰 트랙패드 화면 전환
-├── HidManager.kt     블루투스 HID 등록, HID 디스크립터, 리포트 전송
+├── HidManager.kt     블루투스 HID 등록, 디스크립터, 순서 보장 전송, 세션·실패 관리
+├── HidReports.kt     리포트 바이트·휠 누적 (Android 의존 없음, 단위 테스트 대상)
+├── Haptics.kt        동작별 진동
 ├── TrackpadView.kt   멀티터치 → 제스처 해석 (가속, 관성 스크롤, 핀치, 스와이프)
 └── Settings.kt       설정 저장
 ```
